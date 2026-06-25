@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Galileo Martinez
+set -euo pipefail
+
+CONFIG_FILE="${TELEGRAM_NOTIFY_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/telegram-notify.conf}"
+PREFIX_HOST="${TELEGRAM_NOTIFY_PREFIX_HOST:-true}"
+
+show_help() {
+  cat <<EOF
+telegram-notify
+
+Problem it solves:
+  Scripts and system services often need one reliable way to send a short alert
+  without each script knowing Telegram API details. telegram-notify reads a
+  private config file and sends a plain-text message.
+
+Connection to other scripts:
+  smartd-telegram and mdadm-telegram call this script. The rclone scripts do not
+  require it, but it is useful from cron, systemd, or wrapper scripts that report
+  sync failures.
+
+Usage:
+  telegram-notify [message...]
+  telegram-notify --help
+
+Examples:
+  cp examples/telegram-notify.conf.example ~/.config/telegram-notify.conf
+  chmod 600 ~/.config/telegram-notify.conf
+  telegram-notify "Backup completed"
+  TELEGRAM_NOTIFY_PREFIX_HOST=false telegram-notify "Plain message"
+
+Extras:
+  TELEGRAM_NOTIFY_CONFIG sets the config path.
+  TELEGRAM_NOTIFY_PREFIX_HOST=false disables the default hostname prefix.
+  Keep the real config file out of Git.
+
+Create a Telegram bot and get credentials:
+  1. In Telegram, open a chat with @BotFather.
+  2. Send /newbot.
+  3. Follow the prompts for a display name and a username ending in bot.
+  4. Copy the bot token BotFather gives you.
+  5. Start a chat with your new bot and send it any message.
+  6. Visit https://api.telegram.org/bot<token>/getUpdates in a browser.
+  7. Copy the numeric chat.id from the JSON response.
+  8. Put both values in your config:
+
+     BOT_TOKEN="123456:replace-with-real-token"
+     CHAT_ID="123456789"
+
+  For a group chat, add the bot to the group, send a message in the group, then
+  use getUpdates; group chat IDs are often negative numbers.
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  show_help
+  exit 0
+fi
+
+if [[ ! -r "${CONFIG_FILE}" ]]; then
+  echo "ERROR: Telegram config is not readable: ${CONFIG_FILE}" >&2
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source "${CONFIG_FILE}"
+
+: "${BOT_TOKEN:?BOT_TOKEN is not set in ${CONFIG_FILE}}"
+: "${CHAT_ID:?CHAT_ID is not set in ${CONFIG_FILE}}"
+
+message="${*:-"(no message)"}"
+if [[ "${PREFIX_HOST}" == "true" ]]; then
+  message="[$(hostname)] ${message}"
+fi
+
+curl --fail --silent --show-error \
+  --max-time 20 \
+  --retry 2 \
+  --request POST \
+  "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+  --data-urlencode "chat_id=${CHAT_ID}" \
+  --data-urlencode "text=${message}" \
+  >/dev/null

@@ -1,0 +1,2 @@
+# Send a weekly mdadm proof-of-life report every Monday at 09:00.
+0 9 * * 1 TELEGRAM_NOTIFY_CONFIG=/etc/telegram-notify.conf /usr/local/bin/mdadm-telegram --status

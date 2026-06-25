@@ -1,0 +1,38 @@
+# Example config for rclone-managed-bisync.
+# Copy to ~/.config/rclone-managed-bisync.conf and edit for your host.
+
+# Optional: point to a specific rclone config.
+# RCLONE_CONFIG="/root/.config/rclone/rclone.conf"
+
+RCLONE_TRANSFERS=8
+RCLONE_CHECKERS=16
+RCLONE_LOG_LEVEL="INFO"
+RCLONE_BISYNC_CONFLICT_RESOLVE="path1"
+RCLONE_BISYNC_CONFLICT_LOSER="pathname"
+RCLONE_BISYNC_CONFLICT_SUFFIX=".local,.remote"
+
+JOBS=(photos documents)
+
+JOB_photos_NAME="photos"
+JOB_photos_LOCAL="/srv/sync/photos"
+JOB_photos_REMOTE="gdrive:photos"
+JOB_photos_WORKDIR="/var/lib/rclone-bisync/photos"
+JOB_photos_LOGDIR="/var/log/rclone-bisync/photos"
+JOB_photos_OWNER_GROUP=""
+JOB_photos_AFTER_SYNC=""
+JOB_photos_OPTS=(
+  "--exclude-from=/etc/rclone-bisync/photos-excludes.txt"
+)
+
+JOB_documents_NAME="documents"
+JOB_documents_LOCAL="/srv/sync/documents"
+JOB_documents_REMOTE="s3:documents"
+JOB_documents_WORKDIR="/var/lib/rclone-bisync/documents"
+JOB_documents_LOGDIR="/var/log/rclone-bisync/documents"
+JOB_documents_OWNER_GROUP=""
+JOB_documents_AFTER_SYNC=""
+JOB_documents_OPTS=()
+
+# Nextcloud-style hook example:
+# JOB_documents_OWNER_GROUP="www-data:www-data"
+# JOB_documents_AFTER_SYNC='docker exec -u www-data nextcloud php occ files:scan --path="alice/files/documents"'

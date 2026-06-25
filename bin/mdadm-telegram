@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Galileo Martinez
+set -u -o pipefail
+
+NOTIFY_BIN="${TELEGRAM_NOTIFY_BIN:-telegram-notify}"
+MDSTAT_FILE="${MDADM_MDSTAT_FILE:-/proc/mdstat}"
+CONFIRM_DELAY="${MDADM_CONFIRM_DELAY:-30}"
+RUNTIME_DIR="${MDADM_RUNTIME_DIR:-/run/mdadm-telegram}"
+HOST="$(hostname)"
+
+show_help() {
+  cat <<EOF
+mdadm-telegram
+
+Problem it solves:
+  mdadm can call a program for every RAID event, including routine rebuild
+  progress. mdadm-telegram filters out noisy informational events, confirms
+  transient disappearance events, and sends actionable RAID alerts or
+  proof-of-life status reports.
+
+Connection to other scripts:
+  This depends on telegram-notify for delivery. It complements smartd-telegram:
+  SMART alerts tell you about disk health, while mdadm alerts tell you about
+  array health.
+
+Usage:
+  mdadm-telegram <event> <md-device> [devices]
+  mdadm-telegram --status
+  mdadm-telegram --help
+
+Examples:
+  mdadm-telegram Fail /dev/md0 /dev/sdb1
+  mdadm-telegram DegradedArray /dev/md0 unknown
+  mdadm-telegram --status
+
+Extras:
+  TELEGRAM_NOTIFY_BIN sets the notify command. Default: telegram-notify.
+  MDADM_MDSTAT_FILE sets the mdstat path. Default: /proc/mdstat.
+  MDADM_CONFIRM_DELAY controls confirmation delay for DeviceDisappeared.
+  MDADM_RUNTIME_DIR stores lock files for duplicate suppression.
+EOF
+}
+
+read_mdstat() {
+  if [[ -r "${MDSTAT_FILE}" ]]; then
+    cat "${MDSTAT_FILE}"
+  else
+    printf 'Unable to read %s\n' "${MDSTAT_FILE}"
+  fi
+}
+
+array_mdstat() {
+  local array_name="$1"
+
+  [[ -r "${MDSTAT_FILE}" ]] || return 1
+  awk -v name="${array_name}" '
+    $1 == name && $2 == ":" { found = 1 }
+    found && /^[[:space:]]*$/ { exit }
+    found { print }
+  ' "${MDSTAT_FILE}"
+}
+
+array_is_healthy() {
+  local status
+
+  status="$(array_mdstat "$1")"
+  [[ -n "${status}" ]] || return 1
+  if [[ "${status}" =~ \[([0-9]+)/([0-9]+)\][[:space:]]+\[([U_]+)\] ]]; then
+    [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] &&
+      [[ "${BASH_REMATCH[3]}" != *"_"* ]]
+  else
+    return 1
+  fi
+}
+
+send_status() {
+  local mdstat health
+
+  mdstat="$(read_mdstat)"
+  if grep -Eq '\[[0-9]+/[0-9]+\][[:space:]]+\[[U_]*_[U_]*\]' <<<"${mdstat}"; then
+    health="ATTENTION REQUIRED: at least one RAID member is missing"
+  elif grep -Eq '^md[^[:space:]]*[[:space:]]*:' <<<"${mdstat}"; then
+    health="Healthy"
+  else
+    health="ATTENTION REQUIRED: no active md arrays found"
+  fi
+
+  exec "${NOTIFY_BIN}" "MDADM status on ${HOST}
+Time: $(date '+%Y-%m-%d %H:%M:%S')
+Status: ${health}
+
+mdstat output:
+${mdstat}"
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  show_help
+  exit 0
+fi
+
+if [[ "${1:-}" == "--status" ]]; then
+  send_status
+fi
+
+event="${1:-${MDADM_EVENT:-Unknown}}"
+md_device="${2:-${MDADM_DEVICE:-Unknown}}"
+devices="${3:-${MDADM_DISKS:-Unknown}}"
+array_name="$(basename "${md_device}")"
+
+case "${event}" in
+  NewArray|RebuildStarted|Rebuild[0-9][0-9]|SpareActive|MoveSpare)
+    exit 0
+    ;;
+  RebuildFinished)
+    array_is_healthy "${array_name}" && exit 0
+    ;;
+  DeviceDisappeared)
+    [[ "${CONFIRM_DELAY}" =~ ^[0-9]+$ ]] || CONFIRM_DELAY=30
+    if command -v flock >/dev/null 2>&1 && mkdir -p "${RUNTIME_DIR}" 2>/dev/null; then
+      exec 9>"${RUNTIME_DIR}/${array_name}.lock"
+      flock -n 9 || exit 0
+    fi
+    sleep "${CONFIRM_DELAY}"
+    array_is_healthy "${array_name}" && exit 0
+    ;;
+  Fail|FailSpare|DegradedArray|SparesMissing|TestMessage)
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+
+mdstat="$(array_mdstat "${array_name}")"
+[[ -n "${mdstat}" ]] || mdstat="No matching array found in ${MDSTAT_FILE}"
+
+level="${MDADM_LEVEL:-Unknown}"
+num_devices="${MDADM_DEVICES:-Unknown}"
+state="Degraded or unavailable"
+array_is_healthy "${array_name}" && state="Healthy"
+
+exec "${NOTIFY_BIN}" "MDADM RAID ALERT on ${HOST}
+Time: $(date '+%Y-%m-%d %H:%M:%S')
+
+Event: ${event}
+Array: ${md_device}
+Devices involved: ${devices}
+
+RAID level: ${level}
+Array state: ${state}
+Active devices: ${num_devices}
+
+mdstat output:
+${mdstat}"

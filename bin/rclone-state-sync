@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Galileo Martinez
+set -euo pipefail
+
+STATE_NAME="${RCLONE_STATE_SYNC_STATE_NAME:-rclone.state}"
+LOG_PREFIX="${RCLONE_STATE_SYNC_LOG_PREFIX:-rclone-state-sync}"
+RCLONE_BIN="${RCLONE_BIN:-rclone}"
+
+usage() {
+  echo "Usage: rclone-state-sync <local-path> <rclone_remote:path>"
+  echo "       rclone-state-sync <local-path> --create-state"
+}
+
+show_help() {
+  cat <<EOF
+rclone-state-sync
+
+Problem it solves:
+  rclone sync is powerful, but it can feel too opaque when you want a
+  local-source-of-truth workflow with a visible record of what changed.
+  rclone-state-sync keeps a small state file locally and remotely, detects
+  added, updated, and deleted paths, then applies those changes to the remote.
+
+Connection to other scripts:
+  This is the standalone one-off sync tool. Use rclone-push-sync when you want
+  named jobs from a config file, and use rclone-managed-bisync when both sides
+  are allowed to change.
+
+Usage:
+  rclone-state-sync <local-path> <rclone_remote:path>
+  rclone-state-sync <local-path> --create-state
+  rclone-state-sync --help
+
+Examples:
+  rclone-state-sync /srv/backups/photos gdrive:backups/photos
+  rclone-state-sync ./documents s3:archive/documents
+  rclone-state-sync /srv/backups/photos --create-state
+
+Extras:
+  RCLONE_BIN                    rclone binary. Default: rclone.
+  RCLONE_STATE_SYNC_STATE_NAME  state filename. Default: rclone.state.
+  RCLONE_STATE_SYNC_LOG_PREFIX  log filename prefix.
+
+Safety:
+  This command can delete destination files when they no longer exist locally.
+EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+log() {
+  local message="$*"
+  echo "${message}" | tee -a "${LOG_FILE}"
+}
+
+timestamp() {
+  date +"%Y-%m-%dT%H:%M:%S%z"
+}
+
+require_rclone() {
+  command -v "${RCLONE_BIN}" >/dev/null 2>&1 || die "rclone is not installed or RCLONE_BIN is invalid"
+}
+
+canonical_local_path() {
+  local path="$1"
+
+  [[ -d "${path}" ]] || die "local path does not exist or is not a directory: ${path}"
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "${path}"
+  else
+    (cd "${path}" && pwd -P)
+  fi
+}
+
+stat_size() {
+  stat -f '%z' "$1" 2>/dev/null || stat -c '%s' "$1"
+}
+
+stat_mtime() {
+  stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1"
+}
+
+remote_child() {
+  local child="$1"
+  printf '%s/%s' "${REMOTE_PATH%/}" "${child}"
+}
+
+validate_remote_path() {
+  if [[ "$1" == :*:* ]]; then
+    return 0
+  fi
+
+  [[ "$1" == *:* ]] || die "remote path must look like rclone_remote:path"
+  [[ "$1" != :* ]] || die "remote path is missing the remote name"
+}
+
+test_remote_connection() {
+  local remote_root
+
+  if [[ "${REMOTE_PATH}" == :*:* ]]; then
+    local without_leading_colon="${REMOTE_PATH#:}"
+    remote_root=":${without_leading_colon%%:*}:"
+  else
+    remote_root="${REMOTE_PATH%%:*}:"
+  fi
+
+  if ! "${RCLONE_BIN}" lsf "${remote_root}" --max-depth 1 >/dev/null; then
+    die "could not connect to rclone remote: ${remote_root}"
+  fi
+}
+
+extract_state_body() {
+  local state_file="$1"
+  local body_file="$2"
+
+  grep -v '^#' "${state_file}" | LC_ALL=C sort > "${body_file}" || true
+}
+
+create_empty_state() {
+  local state_file="$1"
+
+  {
+    echo "# rclone-state-sync-state-v1"
+    echo "# generated=$(timestamp)"
+    echo "# local=${LOCAL_PATH}"
+    echo "# remote=${REMOTE_PATH:-}"
+    echo "# entries=0"
+  } > "${state_file}"
+}
+
+build_state() {
+  local state_file="$1"
+  local body_file
+  body_file="$(mktemp)"
+
+  while IFS= read -r -d '' path; do
+    local rel="${path#${LOCAL_PATH}/}"
+
+    if [[ "${rel}" == *$'\t'* || "${rel}" == *$'\n'* ]]; then
+      rm -f "${body_file}"
+      die "paths containing tabs or newlines are not supported in state files: ${rel}"
+    fi
+
+    if [[ -d "${path}" ]]; then
+      printf 'D\t0\t%s\t%s\n' "$(stat_mtime "${path}")" "${rel}" >> "${body_file}"
+    elif [[ -f "${path}" ]]; then
+      printf 'F\t%s\t%s\t%s\n' "$(stat_size "${path}")" "$(stat_mtime "${path}")" "${rel}" >> "${body_file}"
+    fi
+  done < <(
+    find "${LOCAL_PATH}" -mindepth 1 \
+      \( -name "${STATE_NAME}" -o -name "${LOG_PREFIX}-*.log" \) -prune \
+      -o -print0
+  )
+
+  {
+    echo "# rclone-state-sync-state-v1"
+    echo "# generated=$(timestamp)"
+    echo "# local=${LOCAL_PATH}"
+    echo "# remote=${REMOTE_PATH:-}"
+    echo "# entries=$(wc -l < "${body_file}" | tr -d ' ')"
+    LC_ALL=C sort "${body_file}"
+  } > "${state_file}"
+
+  rm -f "${body_file}"
+}
+
+prepare_change_lists() {
+  extract_state_body "${STATE_FILE}" "${OLD_BODY}"
+  extract_state_body "${NEW_STATE}" "${NEW_BODY}"
+
+  awk -F '\t' '
+    FILENAME == ARGV[1] { old[$4] = $0; next }
+    $1 == "D" && !($4 in old) { print $4 }
+  ' "${OLD_BODY}" "${NEW_BODY}" > "${DIRS_ADDED}"
+
+  awk -F '\t' -v added="${FILES_ADDED}" -v updated="${FILES_UPDATED}" '
+    FILENAME == ARGV[1] { old[$4] = $0; next }
+    $1 == "F" && !($4 in old) { print $4 > added; next }
+    $1 == "F" && old[$4] != $0 { print $4 > updated }
+  ' "${OLD_BODY}" "${NEW_BODY}"
+
+  awk -F '\t' '
+    FILENAME == ARGV[1] { current[$4] = 1; next }
+    $1 == "F" && !($4 in current) { print $4 }
+  ' "${NEW_BODY}" "${OLD_BODY}" > "${FILES_DELETED}"
+
+  awk -F '\t' '
+    FILENAME == ARGV[1] { current[$4] = 1; next }
+    $1 == "D" && !($4 in current) { print $4 }
+  ' "${NEW_BODY}" "${OLD_BODY}" | LC_ALL=C sort -r > "${DIRS_DELETED}"
+}
+
+count_lines() {
+  wc -l < "$1" | tr -d ' '
+}
+
+apply_remote_changes() {
+  local rel
+
+  while IFS= read -r rel; do
+    [[ -n "${rel}" ]] || continue
+    log "ADD_DIR ${rel}"
+    "${RCLONE_BIN}" mkdir "$(remote_child "${rel}")"
+  done < "${DIRS_ADDED}"
+
+  while IFS= read -r rel; do
+    [[ -n "${rel}" ]] || continue
+    log "ADD ${rel}"
+    "${RCLONE_BIN}" copyto "${LOCAL_PATH}/${rel}" "$(remote_child "${rel}")"
+  done < "${FILES_ADDED}"
+
+  while IFS= read -r rel; do
+    [[ -n "${rel}" ]] || continue
+    log "UPDATE ${rel}"
+    "${RCLONE_BIN}" copyto "${LOCAL_PATH}/${rel}" "$(remote_child "${rel}")"
+  done < "${FILES_UPDATED}"
+
+  while IFS= read -r rel; do
+    [[ -n "${rel}" ]] || continue
+    log "DELETE ${rel}"
+    "${RCLONE_BIN}" deletefile "$(remote_child "${rel}")"
+  done < "${FILES_DELETED}"
+
+  while IFS= read -r rel; do
+    [[ -n "${rel}" ]] || continue
+    log "DELETE_DIR ${rel}"
+    if ! "${RCLONE_BIN}" rmdir "$(remote_child "${rel}")"; then
+      log "WARN could not remove remote directory, it may not be empty: ${rel}"
+    fi
+  done < "${DIRS_DELETED}"
+}
+
+cleanup() {
+  rm -f "${REMOTE_STATE_TMP:-}" "${NEW_STATE:-}" "${OLD_BODY:-}" "${NEW_BODY:-}" \
+    "${DIRS_ADDED:-}" "${FILES_ADDED:-}" "${FILES_UPDATED:-}" \
+    "${FILES_DELETED:-}" "${DIRS_DELETED:-}"
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  show_help
+  exit 0
+fi
+
+if [[ $# -ne 2 ]]; then
+  usage >&2
+  exit 2
+fi
+
+LOCAL_PATH="$(canonical_local_path "$1")"
+
+if [[ "$2" == "--create-state" ]]; then
+  REMOTE_PATH=""
+  STATE_FILE="${LOCAL_PATH}/${STATE_NAME}"
+  build_state "${STATE_FILE}"
+  echo "State file created: ${STATE_FILE}"
+  exit 0
+fi
+
+REMOTE_PATH="$2"
+validate_remote_path "${REMOTE_PATH}"
+
+STATE_FILE="${LOCAL_PATH}/${STATE_NAME}"
+LOG_FILE="${LOCAL_PATH}/${LOG_PREFIX}-$(date +'%F_%H%M%S').log"
+REMOTE_STATE="$(remote_child "${STATE_NAME}")"
+
+REMOTE_STATE_TMP="$(mktemp)"
+NEW_STATE="$(mktemp)"
+OLD_BODY="$(mktemp)"
+NEW_BODY="$(mktemp)"
+DIRS_ADDED="$(mktemp)"
+FILES_ADDED="$(mktemp)"
+FILES_UPDATED="$(mktemp)"
+FILES_DELETED="$(mktemp)"
+DIRS_DELETED="$(mktemp)"
+trap cleanup EXIT
+
+touch "${LOG_FILE}"
+
+require_rclone
+log "==== $(timestamp) rclone-state-sync start ===="
+log "Local : ${LOCAL_PATH}"
+log "Remote: ${REMOTE_PATH}"
+log "Log   : ${LOG_FILE}"
+
+test_remote_connection
+log "OK remote connection verified"
+
+if [[ ! -f "${STATE_FILE}" ]]; then
+  log "Local state missing; creating ${STATE_FILE}"
+  create_empty_state "${STATE_FILE}"
+fi
+
+"${RCLONE_BIN}" mkdir "${REMOTE_PATH}"
+
+if "${RCLONE_BIN}" cat "${REMOTE_STATE}" > "${REMOTE_STATE_TMP}" 2>/dev/null; then
+  if cmp -s "${STATE_FILE}" "${REMOTE_STATE_TMP}"; then
+    log "OK remote state matches local state"
+  else
+    log "Remote state differs from local state; it will be updated after this sync"
+  fi
+else
+  log "Remote state missing; copying local state before other files"
+  "${RCLONE_BIN}" copyto "${STATE_FILE}" "${REMOTE_STATE}"
+fi
+
+build_state "${NEW_STATE}"
+prepare_change_lists
+
+log "Changes detected: additions=$(count_lines "${FILES_ADDED}") updates=$(count_lines "${FILES_UPDATED}") deletions=$(count_lines "${FILES_DELETED}") directories_added=$(count_lines "${DIRS_ADDED}") directories_deleted=$(count_lines "${DIRS_DELETED}")"
+
+apply_remote_changes
+
+mv "${NEW_STATE}" "${STATE_FILE}"
+"${RCLONE_BIN}" copyto "${STATE_FILE}" "${REMOTE_STATE}"
+
+log "==== $(timestamp) sync complete ===="
+echo "Sync complete."

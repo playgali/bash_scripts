@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Galileo Martinez
+set -u -o pipefail
+
+CONFIG_FILE="${RCLONE_MANAGED_BISYNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/rclone-managed-bisync.conf}"
+RCLONE_BIN="${RCLONE_BIN:-rclone}"
+
+usage() {
+  echo "Usage: rclone-managed-bisync [job-name|all]"
+}
+
+show_help() {
+  cat <<EOF
+rclone-managed-bisync
+
+Problem it solves:
+  rclone bisync is useful when two locations can both change, but scheduled
+  bisync jobs need durable workdirs, logs, conflict policy, and careful recovery
+  when rclone marks a listing pair unusable. This script wraps named bisync jobs
+  with those operational guardrails.
+
+Connection to other scripts:
+  This is the two-way sync runner. It can call post-sync hooks such as a
+  Nextcloud occ files:scan; it does not require Telegram, but you can pair it
+  with telegram-notify from cron or systemd failure handlers.
+
+Usage:
+  rclone-managed-bisync [job-name|all]
+  rclone-managed-bisync --help
+
+Examples:
+  cp examples/rclone-managed-bisync.conf.example ~/.config/rclone-managed-bisync.conf
+  RCLONE_MANAGED_BISYNC_CONFIG=~/.config/rclone-managed-bisync.conf rclone-managed-bisync photos
+  rclone-managed-bisync all
+
+Extras:
+  Config is Bash syntax; see examples/rclone-managed-bisync.conf.example.
+  JOB_<name>_LOCAL, JOB_<name>_REMOTE, JOB_<name>_WORKDIR, and
+  JOB_<name>_LOGDIR are required per job.
+  JOB_<name>_OPTS adds job-specific rclone flags.
+  JOB_<name>_OWNER_GROUP can repair local ownership after sync.
+  JOB_<name>_AFTER_SYNC can run a hook after a successful job.
+  RCLONE_MANAGED_BISYNC_CONFIG sets the config path.
+  RCLONE_BIN sets the rclone binary. Default: rclone.
+EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+timestamp() {
+  date +"%Y-%m-%dT%H:%M:%S%z"
+}
+
+load_config() {
+  [[ -r "${CONFIG_FILE}" ]] || die "config is not readable: ${CONFIG_FILE}"
+  # shellcheck source=/dev/null
+  source "${CONFIG_FILE}"
+}
+
+array_contains() {
+  local needle="$1"
+  shift
+  local value
+  for value in "$@"; do
+    [[ "${value}" == "${needle}" ]] && return 0
+  done
+  return 1
+}
+
+job_var() {
+  local job="$1"
+  local key="$2"
+  local var="JOB_${job}_${key}"
+  printf '%s' "${!var:-}"
+}
+
+job_opts() {
+  local job="$1"
+  local var="JOB_${job}_OPTS[@]"
+  if declare -p "JOB_${job}_OPTS" >/dev/null 2>&1; then
+    printf '%s\0' "${!var}"
+  fi
+}
+
+run_hook() {
+  local hook="$1"
+  [[ -n "${hook}" ]] || return 0
+  echo "Hook : ${hook}"
+  bash -c "${hook}"
+}
+
+run_one() {
+  local job="$1"
+  local name local_path remote workdir logdir logfile owner_group after_hook
+  local conflict_resolve conflict_loser conflict_suffix rclone_config
+  local -a common_opts extra_opts resync_opts
+
+  name="$(job_var "${job}" "NAME")"
+  local_path="$(job_var "${job}" "LOCAL")"
+  remote="$(job_var "${job}" "REMOTE")"
+  workdir="$(job_var "${job}" "WORKDIR")"
+  logdir="$(job_var "${job}" "LOGDIR")"
+  owner_group="$(job_var "${job}" "OWNER_GROUP")"
+  after_hook="$(job_var "${job}" "AFTER_SYNC")"
+
+  [[ -n "${name}" ]] || name="${job}"
+  [[ -n "${local_path}" ]] || die "JOB_${job}_LOCAL is required"
+  [[ -n "${remote}" ]] || die "JOB_${job}_REMOTE is required"
+  [[ -n "${workdir}" ]] || die "JOB_${job}_WORKDIR is required"
+  [[ -n "${logdir}" ]] || die "JOB_${job}_LOGDIR is required"
+
+  conflict_resolve="${RCLONE_BISYNC_CONFLICT_RESOLVE:-path1}"
+  conflict_loser="${RCLONE_BISYNC_CONFLICT_LOSER:-pathname}"
+  conflict_suffix="${RCLONE_BISYNC_CONFLICT_SUFFIX:-.local,.remote}"
+  rclone_config="${RCLONE_CONFIG:-}"
+
+  common_opts=(
+    "--fast-list"
+    "--checkers=${RCLONE_CHECKERS:-16}"
+    "--transfers=${RCLONE_TRANSFERS:-8}"
+    "--create-empty-src-dirs"
+    "--metadata"
+    "--log-level=${RCLONE_LOG_LEVEL:-INFO}"
+    "--resilient"
+    "--recover"
+  )
+  [[ -z "${rclone_config}" ]] || common_opts=("--config=${rclone_config}" "${common_opts[@]}")
+
+  extra_opts=()
+  while IFS= read -r -d '' opt; do
+    extra_opts+=("${opt}")
+  done < <(job_opts "${job}")
+
+  echo "=== [${name}] $(timestamp) ==="
+  echo "Local : ${local_path}"
+  echo "Remote: ${remote}"
+  echo "Work  : ${workdir}"
+  echo "Logdir: ${logdir}"
+
+  mkdir -p "${workdir}" "${logdir}"
+  if [[ ! -d "${local_path}" ]]; then
+    echo "NOTE: Creating missing local path: ${local_path}"
+    mkdir -p "${local_path}" || return 1
+    [[ -z "${owner_group}" ]] || chown "${owner_group}" "${local_path}" || return 1
+  fi
+
+  quarantine_state() {
+    local reason="$1"
+    local quarantine="${workdir}.bad-$(date +'%F_%H%M%S')-$$"
+
+    if [[ -n "$(find "${workdir}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      if ! mv "${workdir}" "${quarantine}" || ! mkdir -p "${workdir}"; then
+        echo "ERROR: failed to quarantine bad state: ${workdir}"
+        return 1
+      fi
+      echo "NOTE: Quarantined ${reason} state at: ${quarantine}"
+    fi
+  }
+
+  run_bisync() {
+    local mode="$1"
+    logfile="${logdir}/bisync-${name}-$(date +'%F_%H%M%S').log"
+    resync_opts=()
+    [[ "${mode}" != "resync" ]] || resync_opts=("--resync" "--resync-mode" "path1")
+
+    "${RCLONE_BIN}" bisync \
+      "${local_path}" \
+      "${remote}" \
+      --workdir "${workdir}" \
+      "${resync_opts[@]}" \
+      --conflict-resolve "${conflict_resolve}" \
+      --conflict-loser "${conflict_loser}" \
+      --conflict-suffix "${conflict_suffix}" \
+      "${common_opts[@]}" \
+      "${extra_opts[@]}" \
+      --log-file "${logfile}"
+  }
+
+  local run_mode="normal"
+  if compgen -G "${workdir}/*.lst-err" >/dev/null; then
+    quarantine_state "failed" || return 1
+    run_mode="resync"
+  elif ! compgen -G "${workdir}/*.path1.lst" >/dev/null || \
+       ! compgen -G "${workdir}/*.path2.lst" >/dev/null; then
+    quarantine_state "incomplete" || return 1
+    run_mode="resync"
+  fi
+
+  local rc=0
+  [[ "${run_mode}" != "resync" ]] || echo "NOTE: No usable bisync state for '${name}' -> running --resync"
+  run_bisync "${run_mode}" || rc=$?
+
+  if [[ ${rc} -ne 0 && "${run_mode}" == "normal" ]] && \
+     compgen -G "${workdir}/*.lst-err" >/dev/null; then
+    echo "WARN: Bisync marked state unusable for '${name}'"
+    quarantine_state "failed" || return 1
+    echo "NOTE: Retrying '${name}' once with fresh --resync"
+    rc=0
+    run_bisync "resync" || rc=$?
+  fi
+
+  if [[ ${rc} -ne 0 ]]; then
+    echo "ERROR: bisync failed for '${name}' (exit=${rc}). See: ${logfile}"
+    return "${rc}"
+  fi
+
+  if [[ -n "${owner_group}" ]]; then
+    find "${local_path}" -xdev \( ! -user "${owner_group%%:*}" -o ! -group "${owner_group##*:}" \) \
+      -exec chown -h "${owner_group}" {} + || return 1
+  fi
+
+  run_hook "${after_hook}" || return 1
+  echo "OK: ${name} done"
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  show_help
+  exit 0
+fi
+
+load_config
+command -v "${RCLONE_BIN}" >/dev/null 2>&1 || die "rclone is not installed or RCLONE_BIN is invalid"
+
+if [[ -n "${RCLONE_CONFIG:-}" && ! -r "${RCLONE_CONFIG}" ]]; then
+  die "rclone config is not readable: ${RCLONE_CONFIG}"
+fi
+
+declare -a JOBS
+: "${JOBS:?JOBS array is required in ${CONFIG_FILE}}"
+
+selected="${1:-all}"
+if [[ "${selected}" != "all" ]] && ! array_contains "${selected}" "${JOBS[@]}"; then
+  die "unknown job '${selected}'"
+fi
+
+failures=0
+for job in "${JOBS[@]}"; do
+  if [[ "${selected}" == "all" || "${selected}" == "${job}" ]]; then
+    run_one "${job}" || failures=$((failures + 1))
+  fi
+done
+
+echo "All done: $(timestamp) failures=${failures}"
+exit "${failures}"

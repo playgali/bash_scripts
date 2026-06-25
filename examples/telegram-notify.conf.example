@@ -1,0 +1,4 @@
+# Copy to ~/.config/telegram-notify.conf or /etc/telegram-notify.conf.
+# Keep the real file private.
+BOT_TOKEN="replace-with-bot-token"
+CHAT_ID="replace-with-chat-id"

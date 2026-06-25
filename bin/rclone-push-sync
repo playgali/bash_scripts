@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Galileo Martinez
+set -euo pipefail
+
+CONFIG_FILE="${RCLONE_PUSH_SYNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/rclone-push-sync.conf}"
+RCLONE_BIN="${RCLONE_BIN:-rclone}"
+
+usage() {
+  echo "Usage: rclone-push-sync [job-name|all]"
+}
+
+show_help() {
+  cat <<EOF
+rclone-push-sync
+
+Problem it solves:
+  Sometimes you do want plain rclone sync, but with repeatable named jobs,
+  shared defaults, and per-job logs. rclone-push-sync reads a config file and
+  runs local-to-remote sync jobs where local is the source of truth.
+
+Connection to other scripts:
+  This is the configured one-way counterpart to rclone-state-sync. Use
+  rclone-managed-bisync instead when remote-side changes should be brought back
+  locally.
+
+Usage:
+  rclone-push-sync [job-name|all]
+  rclone-push-sync --help
+
+Examples:
+  cp examples/rclone-push-sync.conf.example ~/.config/rclone-push-sync.conf
+  RCLONE_PUSH_SYNC_CONFIG=~/.config/rclone-push-sync.conf rclone-push-sync photos
+  rclone-push-sync all
+
+Extras:
+  Config is Bash syntax; see examples/rclone-push-sync.conf.example.
+  JOB_<name>_LOCAL, JOB_<name>_REMOTE, and JOB_<name>_LOGDIR define each job.
+  JOB_<name>_OPTS adds job-specific rclone flags.
+  RCLONE_PUSH_SYNC_CONFIG sets the config path.
+  RCLONE_BIN sets the rclone binary. Default: rclone.
+
+Safety:
+  This command can delete remote files absent from the local path.
+EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+timestamp() {
+  date +"%Y-%m-%dT%H:%M:%S%z"
+}
+
+load_config() {
+  [[ -r "${CONFIG_FILE}" ]] || die "config is not readable: ${CONFIG_FILE}"
+  # shellcheck source=/dev/null
+  source "${CONFIG_FILE}"
+}
+
+array_contains() {
+  local needle="$1"
+  shift
+  local value
+  for value in "$@"; do
+    [[ "${value}" == "${needle}" ]] && return 0
+  done
+  return 1
+}
+
+job_var() {
+  local job="$1"
+  local key="$2"
+  local var="JOB_${job}_${key}"
+  printf '%s' "${!var:-}"
+}
+
+job_opts() {
+  local job="$1"
+  local var="JOB_${job}_OPTS[@]"
+  if declare -p "JOB_${job}_OPTS" >/dev/null 2>&1; then
+    printf '%s\0' "${!var}"
+  fi
+}
+
+run_one() {
+  local job="$1"
+  local name local_path remote logdir logfile rclone_config
+  local -a flags extra_opts
+
+  name="$(job_var "${job}" "NAME")"
+  local_path="$(job_var "${job}" "LOCAL")"
+  remote="$(job_var "${job}" "REMOTE")"
+  logdir="$(job_var "${job}" "LOGDIR")"
+
+  [[ -n "${name}" ]] || name="${job}"
+  [[ -n "${local_path}" ]] || die "JOB_${job}_LOCAL is required"
+  [[ -n "${remote}" ]] || die "JOB_${job}_REMOTE is required"
+  [[ -n "${logdir}" ]] || logdir="${RCLONE_PUSH_SYNC_LOGDIR:-./logs}"
+  [[ -d "${local_path}" ]] || die "local path does not exist: ${local_path}"
+
+  mkdir -p "${logdir}"
+  logfile="${logdir}/sync-${name}-$(date +'%F_%H%M%S').log"
+  rclone_config="${RCLONE_CONFIG:-}"
+
+  flags=(
+    "--log-file=${logfile}"
+    "--log-level=${RCLONE_LOG_LEVEL:-INFO}"
+    "--fast-list"
+    "--transfers=${RCLONE_TRANSFERS:-8}"
+    "--checkers=${RCLONE_CHECKERS:-16}"
+    "--create-empty-src-dirs"
+    "--tpslimit=${RCLONE_TPSLIMIT:-10}"
+    "--tpslimit-burst=${RCLONE_TPSLIMIT_BURST:-20}"
+  )
+  [[ -z "${rclone_config}" ]] || flags=("--config=${rclone_config}" "${flags[@]}")
+
+  extra_opts=()
+  while IFS= read -r -d '' opt; do
+    extra_opts+=("${opt}")
+  done < <(job_opts "${job}")
+
+  echo "==== $(timestamp) SYNC ${name} local->remote ====" | tee -a "${logfile}"
+  "${RCLONE_BIN}" sync "${flags[@]}" "${extra_opts[@]}" "${local_path}" "${remote}"
+  echo "OK: ${name} done" | tee -a "${logfile}"
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  show_help
+  exit 0
+fi
+
+load_config
+command -v "${RCLONE_BIN}" >/dev/null 2>&1 || die "rclone is not installed or RCLONE_BIN is invalid"
+
+if [[ -n "${RCLONE_CONFIG:-}" && ! -r "${RCLONE_CONFIG}" ]]; then
+  die "rclone config is not readable: ${RCLONE_CONFIG}"
+fi
+
+declare -a JOBS
+: "${JOBS:?JOBS array is required in ${CONFIG_FILE}}"
+
+selected="${1:-all}"
+if [[ "${selected}" != "all" ]] && ! array_contains "${selected}" "${JOBS[@]}"; then
+  die "unknown job '${selected}'"
+fi
+
+failures=0
+for job in "${JOBS[@]}"; do
+  if [[ "${selected}" == "all" || "${selected}" == "${job}" ]]; then
+    run_one "${job}" || failures=$((failures + 1))
+  fi
+done
+
+echo "All done: $(timestamp) failures=${failures}"
+exit "${failures}"

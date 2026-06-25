@@ -1,0 +1,48 @@
+# macOS Finder and filesystem metadata
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+Icon
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Windows Explorer and filesystem metadata
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux and desktop-environment metadata
+*~
+.directory
+.Trash-*/
+.nfs*
+
+# Common file manager thumbnails and caches
+.thumbnails/
+.cache/thumbnails/
+
+# Runtime and generated files
+*.log
+*.tmp
+
+# Local config files may contain credentials, paths, hostnames, or tokens.
+*.conf
+*.env
+!.env.example
+!*.conf.example
+
+# Runtime state created by the scripts.
+*.state
+.rclone-bisync/
+.runtime/

@@ -1,0 +1,9 @@
+[Unit]
+Description=Managed rclone bisync jobs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=RCLONE_MANAGED_BISYNC_CONFIG=/etc/rclone-managed-bisync.conf
+ExecStart=/usr/local/bin/rclone-managed-bisync all

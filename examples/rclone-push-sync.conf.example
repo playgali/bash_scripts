@@ -1,0 +1,28 @@
+# Example config for rclone-push-sync.
+# Copy to ~/.config/rclone-push-sync.conf and edit for your host.
+
+# Optional: point to a specific rclone config.
+# RCLONE_CONFIG="/root/.config/rclone/rclone.conf"
+
+RCLONE_TRANSFERS=8
+RCLONE_CHECKERS=16
+RCLONE_TPSLIMIT=10
+RCLONE_TPSLIMIT_BURST=20
+RCLONE_LOG_LEVEL="INFO"
+RCLONE_PUSH_SYNC_LOGDIR="/var/log/rclone-push-sync"
+
+JOBS=(photos documents)
+
+JOB_photos_NAME="photos"
+JOB_photos_LOCAL="/srv/backups/photos"
+JOB_photos_REMOTE="gdrive:backups/photos"
+JOB_photos_LOGDIR="/var/log/rclone-push-sync/photos"
+JOB_photos_OPTS=()
+
+JOB_documents_NAME="documents"
+JOB_documents_LOCAL="/srv/backups/documents"
+JOB_documents_REMOTE="s3:backups/documents"
+JOB_documents_LOGDIR="/var/log/rclone-push-sync/documents"
+JOB_documents_OPTS=(
+  "--exclude=*.tmp"
+)

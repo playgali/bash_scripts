@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Galileo Martinez
+set -u -o pipefail
+
+NOTIFY_BIN="${TELEGRAM_NOTIFY_BIN:-telegram-notify}"
+
+show_help() {
+  cat <<EOF
+smartd-telegram
+
+Problem it solves:
+  smartd provides disk-health alert details through environment variables, but
+  raw smartd messages are not always convenient to send directly.
+  smartd-telegram formats those variables into a readable alert and passes it
+  to telegram-notify.
+
+Connection to other scripts:
+  This depends on telegram-notify for delivery. Use it alongside mdadm-telegram
+  when a host has both SMART disk monitoring and Linux software RAID.
+
+Usage:
+  smartd-telegram [device] [alert-type] [details]
+  smartd-telegram --help
+
+Examples:
+  smartd-telegram /dev/sda "SMART alert" "Reallocated sector count changed"
+  TELEGRAM_NOTIFY_BIN=/usr/local/bin/telegram-notify smartd-telegram /dev/nvme0n1 "SMART alert" "Manual test"
+
+Extras:
+  TELEGRAM_NOTIFY_BIN sets the notify command. Default: telegram-notify.
+  smartd-provided SMARTD_DEVICE, SMARTD_FAILTYPE, SMARTD_FULLMESSAGE, and
+  SMARTD_MESSAGE are preferred over positional arguments.
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  show_help
+  exit 0
+fi
+
+device="${SMARTD_DEVICE:-${1:-Unknown}}"
+alert_type="${SMARTD_FAILTYPE:-${2:-SMART alert}}"
+details="${SMARTD_FULLMESSAGE:-${SMARTD_MESSAGE:-${3:-No details provided}}}"
+
+exec "${NOTIFY_BIN}" "SMART ALERT
+Device: ${device}
+Type: ${alert_type}
+Details: ${details}"
